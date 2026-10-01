@@ -286,11 +286,20 @@ func TestParseMigDeviceUUID(t *testing.T) {
 // DeviceGetHandleByUUID is used by getMigDeviceParts.
 type fakeNvmlLib struct {
 	nvml.Interface
-	handle nvml.Device
-	ret    nvml.Return
+	handle         nvml.Device
+	ret            nvml.Return
+	handles        map[string]nvml.Device
+	handleRets     map[string]nvml.Return
+	getHandleCalls map[string]int
 }
 
-func (f *fakeNvmlLib) DeviceGetHandleByUUID(string) (nvml.Device, nvml.Return) {
+func (f *fakeNvmlLib) DeviceGetHandleByUUID(uuid string) (nvml.Device, nvml.Return) {
+	if f.getHandleCalls != nil {
+		f.getHandleCalls[uuid]++
+	}
+	if handle, ok := f.handles[uuid]; ok {
+		return handle, f.handleRets[uuid]
+	}
 	return f.handle, f.ret
 }
 
@@ -321,6 +330,78 @@ type fakeParentHandle struct {
 
 func (f *fakeParentHandle) GetUUID() (string, nvml.Return) {
 	return f.uuid, nvml.SUCCESS
+}
+
+type fakeEventSet struct {
+	nvml.EventSet
+}
+
+type fakeHealthHandle struct {
+	nvml.Device
+	supportedEvents uint64
+	supportedRet    nvml.Return
+	registerRet     nvml.Return
+	registerCalls   int
+}
+
+func (f *fakeHealthHandle) GetSupportedEventTypes() (uint64, nvml.Return) {
+	return f.supportedEvents, f.supportedRet
+}
+
+func (f *fakeHealthHandle) RegisterEvents(uint64, nvml.EventSet) nvml.Return {
+	f.registerCalls++
+	return f.registerRet
+}
+
+func TestRegisterHealthEvents(t *testing.T) {
+	deviceA0 := &Device{Device: pluginapi.Device{ID: "MIG-A0"}}
+	deviceA1 := &Device{Device: pluginapi.Device{ID: "MIG-A1"}}
+
+	t.Run("registers once per parent", func(t *testing.T) {
+		handle := &fakeHealthHandle{
+			supportedEvents: ^uint64(0),
+			supportedRet:    nvml.SUCCESS,
+			registerRet:     nvml.SUCCESS,
+		}
+		lib := &fakeNvmlLib{
+			handles:        map[string]nvml.Device{"GPU-A": handle},
+			handleRets:     map[string]nvml.Return{"GPU-A": nvml.SUCCESS},
+			getHandleCalls: map[string]int{},
+		}
+		r := &nvmlResourceManager{nvml: lib}
+		unhealthy := make(chan *Device, 2)
+
+		r.registerHealthEvents(&fakeEventSet{}, ^uint64(0), map[string][]*Device{
+			"GPU-A": {deviceA0, deviceA1},
+		}, unhealthy)
+
+		require.Equal(t, 1, lib.getHandleCalls["GPU-A"])
+		require.Equal(t, 1, handle.registerCalls)
+		require.Len(t, unhealthy, 0)
+	})
+
+	t.Run("registration failure marks every child unhealthy", func(t *testing.T) {
+		handle := &fakeHealthHandle{
+			supportedEvents: ^uint64(0),
+			supportedRet:    nvml.SUCCESS,
+			registerRet:     nvml.ERROR_UNKNOWN,
+		}
+		lib := &fakeNvmlLib{
+			handles:        map[string]nvml.Device{"GPU-A": handle},
+			handleRets:     map[string]nvml.Return{"GPU-A": nvml.SUCCESS},
+			getHandleCalls: map[string]int{},
+		}
+		r := &nvmlResourceManager{nvml: lib}
+		unhealthy := make(chan *Device, 2)
+
+		r.registerHealthEvents(&fakeEventSet{}, ^uint64(0), map[string][]*Device{
+			"GPU-A": {deviceA0, deviceA1},
+		}, unhealthy)
+
+		require.Equal(t, 1, handle.registerCalls)
+		require.Len(t, unhealthy, 2)
+		require.ElementsMatch(t, []*Device{deviceA0, deviceA1}, []*Device{<-unhealthy, <-unhealthy})
+	})
 }
 
 func TestGetMigDeviceParts(t *testing.T) {
